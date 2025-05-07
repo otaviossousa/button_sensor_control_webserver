@@ -1,0 +1,167 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "pico/stdlib.h"
+#include "pico/cyw43_arch.h"
+#include "lib/buttons.h"
+#include "lib/sensor.h"
+#include "lwipopts.h"
+#include "lwip/pbuf.h"
+#include "lwip/tcp.h"
+#include "lwip/netif.h"
+
+// Configurações de Wi-Fi
+#define WIFI_SSID "MudeAqui" // Nome da rede Wi-Fi (SSID)
+#define WIFI_PASSWORD "MudeAqui" // Senha da rede Wi-Fi
+
+char html[1024]; // Buffer para armazenar o conteúdo HTML da página
+char status_button[20]; // Buffer para armazenar o status dos botões
+float temp; // Variável para armazenar a temperatura lida do sensor
+
+// Declaração de funções auxiliares
+void build_html_content(); 
+static err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err);
+static err_t tcp_server_accept(void *arg, struct tcp_pcb *newpcb, err_t err);
+
+int main() {
+    stdio_init_all();    // Inicializa a entrada e saída padrão
+    init_buttons();      // Inicializa os botões
+    init_temp_sensor(); // Inicializa o sensor de temperatura
+
+    // Tenta inicializar o módulo Wi-Fi
+    while (cyw43_arch_init()) {
+        printf("Falha ao inicializar Wi-Fi\n");
+        sleep_ms(100); // Aguarda 100ms antes de tentar novamente
+        return -1; // Sai do programa em caso de falha
+    }
+
+    // Inicializa o Wi-Fi em modo STA (cliente)
+    cyw43_arch_enable_sta_mode();
+
+    printf("Conectando ao Wi-Fi...\n");
+
+    // Conecta ao Wi-Fi com timeout de 20 segundos
+    while (cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PASSWORD, CYW43_AUTH_WPA2_AES_PSK, 20000)) {
+        printf("Falha ao conectar ao Wi-Fi\n");
+        sleep_ms(100);
+        return -1;
+    }
+    
+    printf("Conectado ao Wi-Fi\n");
+    
+    // Exibe o endereço IP do dispositivo, se disponível
+    if (netif_default) {
+        printf("IP do dispositivo: %s\n", ipaddr_ntoa(&netif_default->ip_addr));
+    }
+
+    // Cria um novo PCB (Protocol Control Block) para o servidor TCP
+    struct tcp_pcb *server = tcp_new(); 
+    
+    if (!server) { 
+        printf("Falha ao criar servidor TCP\n");
+        return -1; // Sai do programa em caso de falha
+    }
+    
+    // Associa o servidor TCP à porta 80
+    if (tcp_bind(server, IP_ADDR_ANY, 80) != ERR_OK) { 
+        printf("Falha ao associar servidor TCP à porta 80\n");
+        return -1; // Sai do programa em caso de falha
+    }
+
+    // Coloca o servidor em modo de escuta para conexões TCP
+    server = tcp_listen(server);
+    
+    // Configura o callback para aceitar conexões TCP com o servidor
+    tcp_accept(server, tcp_server_accept);
+
+    printf("Servidor ouvindo na porta 80\n");
+
+    while (true) {
+        // Processa eventos de rede
+        cyw43_arch_poll();
+
+        // Lê a temperatura do sensor
+        temp = temperature_read();
+
+        // Verifica o estado dos botões e atualiza o status
+        if (!gpio_get(BUTTON_A)) {
+            snprintf(status_button, sizeof(status_button), " A pressionado");
+        } else if (!gpio_get(BUTTON_B)) {
+            snprintf(status_button, sizeof(status_button), " B pressionado");
+        } else {
+            snprintf(status_button, sizeof(status_button), " Pressione A ou B");
+        }
+        
+        // Aguarda 1 segundo antes de repetir o loop
+        sleep_ms(1000); 
+    }
+}
+
+// Função para contruir o HTML 
+void build_html_content(){
+
+    snprintf(html, sizeof(html),
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: text/html; charset=UTF-8\r\n"
+    "\r\n"
+    "<!DOCTYPE html>\n"
+    "<html lang=\"pt-BR\">\n"
+    "<head>\n"
+        "<meta charset=\"UTF-8\">\n"
+        "<title>Painel de Status</title>\n"
+    "</head>\n"
+    "<body style=\"background-color:#d7d7d7;display:flex;justify-content:center;align-items:center;height:800px;\">\n"
+            "<table style=\"width: 720px; text-align: center;\">\n"
+                "<tr>\n"
+                    "<td colspan=\"2\"width=\"800px\"style=\"background-color:#320e74;color:#ffffff;font-size:36px;\">\n"
+                        "Painel de Status\n"
+                    "</td>\n"
+                "</tr>\n"
+                "<tr style=\"background-color:#ffffff;\">\n"
+                    "<td style=\"font-size:24px;color:#320e74;\">Botão</td>\n"
+                    "<td style=\"font-size:24px;color:#320e74;\">%s</td>\n"
+                "</tr>\n"
+                "<tr style=\"background-color:#ffffff;\">\n"
+                    "<td style=\"font-size:24px;color:#320e74;\">Temperatura</td>\n"
+                    "<td style=\"font-size:24px;color:#320e74;\">%.2f &deg;C</td>\n"
+                "</tr>\n"
+                "<tr style=\"background-color:#ffffff;\">\n"
+                    "<td colspan=\"2\" style=\"font-size:14px;color:#666;\">&copy; 2025 EmbarcaTech</td>\n"
+                "</tr>\n"
+            "</table>\n"
+        "<script>\n"
+            "setTimeout(() => { window.location.href = \"/\"; }, 1000);\n"
+        "</script>\n"
+    "</body>\n"
+    "</html>\n", status_button, temp);
+}
+
+// Função de callback para processar requisições HTTP
+static err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err) {
+    // Verifica se houve erro na recepção de dados
+    if (!p) {  
+        // Fecha a sessão se for verdadeiro
+        tcp_close(tpcb);
+        // Retorna sucesso 
+        return ERR_OK; 
+    }
+
+    // Formata o HTML com os dados atuais
+    build_html_content(); 
+    // Envia o HTML formatado para o cliente
+    tcp_write(tpcb, html, strlen(html), TCP_WRITE_FLAG_COPY);
+    // Envia os dados para o cliente
+    tcp_output(tpcb); 
+    // Libera o buffer de recepção
+    pbuf_free(p); 
+    // Retorna sucesso
+    return ERR_OK; 
+}
+
+// Função de callback ao aceitar conexões TCP
+static err_t tcp_server_accept(void *arg, struct tcp_pcb *newpcb, err_t err) {
+    // 
+    tcp_recv(newpcb, tcp_server_recv);
+    // Retorna sucesso
+    return ERR_OK;
+}
