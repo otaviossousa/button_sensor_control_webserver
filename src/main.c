@@ -97,7 +97,7 @@ int main() {
     }
 }
 
-// Função para contruir o HTML 
+// Função para construir o HTML 
 void build_html_content() {
     snprintf(html, sizeof(html),
     "HTTP/1.1 200 OK\r\n"
